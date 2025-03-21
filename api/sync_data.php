@@ -1,8 +1,12 @@
 <?php
 /**
  * api/sync_data.php
- * Sincroniza dados locais com o servidor
+ * Sincroniza dados entre o armazenamento local e o banco de dados
  */
+
+// Habilita exibição de erros para depuração
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
 // Inclui o arquivo de configuração
 require_once '../db_config.php';
@@ -31,12 +35,14 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // Obtém os dados enviados
-$dados = json_decode(file_get_contents('php://input'), true);
+$raw_input = file_get_contents('php://input');
+$dados = json_decode($raw_input, true);
 
-if (!$dados) {
+if (!$dados || !isset($dados['action'])) {
     echo json_encode([
         'success' => false,
-        'message' => 'Dados inválidos'
+        'message' => 'Dados inválidos ou ação não especificada',
+        'received' => $raw_input
     ]);
     exit;
 }
@@ -52,107 +58,274 @@ if (!$pdo) {
     exit;
 }
 
-try {
-    // Inicia uma transação
-    $pdo->beginTransaction();
+// Processar a ação solicitada
+$action = $dados['action'];
+
+switch ($action) {
+    case 'sync_saques':
+        syncSaques($pdo, $dados);
+        break;
     
-    // 1. Sincroniza configurações
-    if (isset($dados['config'])) {
-        foreach ($dados['config'] as $chave => $valor) {
-            // Verifica se a configuração já existe
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM config WHERE chave = ?");
-            $stmt->execute([$chave]);
-            $exists = $stmt->fetchColumn() > 0;
-            
-            if ($exists) {
-                // Atualiza
-                $stmt = $pdo->prepare("UPDATE config SET valor = ? WHERE chave = ?");
-                $stmt->execute([$valor, $chave]);
-            } else {
-                // Insere
-                $stmt = $pdo->prepare("INSERT INTO config (chave, valor) VALUES (?, ?)");
-                $stmt->execute([$chave, $valor]);
-            }
-        }
+    case 'set_saques':
+        setSaques($pdo, $dados);
+        break;
+    
+    default:
+        echo json_encode([
+            'success' => false,
+            'message' => 'Ação desconhecida: ' . $action
+        ]);
+}
+
+/**
+ * Sincroniza saques do cliente com o servidor
+ */
+function syncSaques($pdo, $dados) {
+    if (!isset($dados['saques']) || !is_array($dados['saques'])) {
+        echo json_encode([
+            'success' => false,
+            'message' => 'Dados de saques não fornecidos ou inválidos'
+        ]);
+        return;
     }
     
-    // 2. Sincroniza cotação
-    if (isset($dados['cotacao'])) {
-        $cotacao = $dados['cotacao'];
-        
-        // Verifica se já existe uma cotação com o mesmo timestamp
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM cotacao WHERE timestamp = ?");
-        $stmt->execute([$cotacao['timestamp']]);
-        $exists = $stmt->fetchColumn() > 0;
-        
-        if (!$exists) {
-            // Insere a nova cotação
-            $manual = isset($cotacao['manual']) ? (int)$cotacao['manual'] : 0;
-            $stmt = $pdo->prepare("INSERT INTO cotacao (valor, timestamp, manual) VALUES (?, ?, ?)");
-            $stmt->execute([$cotacao['valor'], $cotacao['timestamp'], $manual]);
-        }
-    }
+    $saques = $dados['saques'];
+    $processados = 0;
+    $erros = 0;
     
-    // 3. Sincroniza saques
-    if (isset($dados['saques']) && is_array($dados['saques'])) {
-        foreach ($dados['saques'] as $saque) {
-            // Verifica se o saque já existe (pelo id_interno)
-            $stmt = $pdo->prepare("SELECT COUNT(*) FROM saques WHERE id_interno = ?");
+    try {
+        // Inicia uma transação para garantir a integridade
+        $pdo->beginTransaction();
+        
+        foreach ($saques as $saque) {
+            // Verifica se o saque já existe no banco
+            $stmt = $pdo->prepare("SELECT id FROM saques WHERE id_interno = ?");
             $stmt->execute([$saque['id_interno']]);
-            $exists = $stmt->fetchColumn() > 0;
+            $existente = $stmt->fetch();
             
-            if (!$exists) {
-                // Prepara o timestamp
-                $timestamp = isset($saque['timestamp']) ? $saque['timestamp'] : date('Y-m-d H:i:s');
-                
-                // Insere o novo saque
-                $stmt = $pdo->prepare("INSERT INTO saques (
-                    id_interno, timestamp, nome, cpf, id_externo, banco, agencia, conta, pix,
-                    valorUSD, cotacao, valorTotal, taxaSaque
-                ) VALUES (
-                    :id_interno, :timestamp, :nome, :cpf, :id_externo, :banco, :agencia, :conta, :pix,
-                    :valorUSD, :cotacao, :valorTotal, :taxaSaque
-                )");
+            if ($existente) {
+                // Saque já existe, atualiza
+                $stmt = $pdo->prepare("UPDATE saques SET 
+                    nome = ?,
+                    cpf = ?,
+                    id_externo = ?,
+                    banco = ?,
+                    agencia = ?,
+                    conta = ?,
+                    pix = ?,
+                    valorUSD = ?,
+                    cotacao = ?,
+                    valorTotal = ?,
+                    taxaSaque = ?
+                WHERE id_interno = ?");
                 
                 $stmt->execute([
-                    'id_interno' => $saque['id_interno'],
-                    'timestamp' => $timestamp,
-                    'nome' => $saque['nome'] ?? '',
-                    'cpf' => $saque['cpf'] ?? '',
-                    'id_externo' => $saque['id'] ?? '',
-                    'banco' => $saque['banco'] ?? '',
-                    'agencia' => $saque['agencia'] ?? '',
-                    'conta' => $saque['conta'] ?? '',
-                    'pix' => $saque['pix'] ?? '',
-                    'valorUSD' => $saque['valorUSD'] ?? 0,
-                    'cotacao' => $saque['cotacao'] ?? 0,
-                    'valorTotal' => $saque['valorTotal'] ?? 0,
-                    'taxaSaque' => $saque['taxaSaque'] ?? 0,
+                    $saque['nome'] ?? '',
+                    $saque['cpf'] ?? '',
+                    $saque['id'] ?? '',
+                    $saque['banco'] ?? '',
+                    $saque['agencia'] ?? '',
+                    $saque['conta'] ?? '',
+                    $saque['pix'] ?? '',
+                    $saque['valorUSD'] ?? 0,
+                    $saque['cotacao'] ?? 0,
+                    $saque['valorTotal'] ?? 0,
+                    $saque['taxaSaque'] ?? 0,
+                    $saque['id_interno']
+                ]);
+            } else {
+                // Insere novo saque
+                $stmt = $pdo->prepare("INSERT INTO saques (
+                    id_interno,
+                    timestamp,
+                    nome,
+                    cpf,
+                    id_externo,
+                    banco,
+                    agencia,
+                    conta,
+                    pix,
+                    valorUSD,
+                    cotacao,
+                    valorTotal,
+                    taxaSaque
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                
+                $timestamp = isset($saque['timestamp']) ? $saque['timestamp'] : date('Y-m-d H:i:s');
+                
+                $stmt->execute([
+                    $saque['id_interno'],
+                    $timestamp,
+                    $saque['nome'] ?? '',
+                    $saque['cpf'] ?? '',
+                    $saque['id'] ?? '',
+                    $saque['banco'] ?? '',
+                    $saque['agencia'] ?? '',
+                    $saque['conta'] ?? '',
+                    $saque['pix'] ?? '',
+                    $saque['valorUSD'] ?? 0,
+                    $saque['cotacao'] ?? 0,
+                    $saque['valorTotal'] ?? 0,
+                    $saque['taxaSaque'] ?? 0
                 ]);
             }
+            
+            $processados++;
         }
-    }
-    
-    // Confirma a transação
-    $pdo->commit();
-    
-    // Retorna todos os saques após a sincronização
-    $stmt = $pdo->query("SELECT * FROM saques ORDER BY timestamp DESC");
-    $saques = $stmt->fetchAll();
-    
-    echo json_encode([
-        'success' => true,
-        'message' => 'Dados sincronizados com sucesso!',
-        'saques' => $saques
-    ]);
-} catch (PDOException $e) {
-    // Reverte a transação em caso de erro
-    if ($pdo->inTransaction()) {
+        
+        // Comita a transação
+        $pdo->commit();
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Sincronização concluída com sucesso',
+            'stats' => [
+                'processados' => $processados,
+                'erros' => $erros
+            ]
+        ]);
+    } catch (PDOException $e) {
+        // Reverte a transação em caso de erro
         $pdo->rollBack();
+        
+        echo json_encode([
+            'success' => false,
+            'message' => 'Erro durante a sincronização: ' . $e->getMessage(),
+            'stats' => [
+                'processados' => $processados,
+                'erros' => $erros + 1
+            ]
+        ]);
+    }
+}
+
+/**
+ * Define a lista completa de saques (substitui a atual)
+ */
+function setSaques($pdo, $dados) {
+    if (!isset($dados['saques']) || !is_array($dados['saques'])) {
+        echo json_encode([
+            'success' => false,
+            'message' => 'Dados de saques não fornecidos ou inválidos'
+        ]);
+        return;
     }
     
-    echo json_encode([
-        'success' => false,
-        'message' => 'Erro ao sincronizar dados: ' . $e->getMessage()
-    ]);
+    $saques = $dados['saques'];
+    try {
+        // Inicia uma transação para garantir a integridade
+        $pdo->beginTransaction();
+        
+        // Limpa a tabela atual (opcional, pode ser comentado se preferir manter histórico)
+        // $pdo->exec("TRUNCATE TABLE saques");
+        
+        $processados = 0;
+        
+        foreach ($saques as $saque) {
+            // Verifica se o saque já existe pelo id_interno
+            $stmt = $pdo->prepare("SELECT id FROM saques WHERE id_interno = ?");
+            $stmt->execute([$saque['id_interno']]);
+            $existente = $stmt->fetch();
+            
+            if ($existente) {
+                // Atualiza o saque existente
+                $stmt = $pdo->prepare("UPDATE saques SET 
+                    timestamp = ?,
+                    nome = ?,
+                    cpf = ?,
+                    id_externo = ?,
+                    banco = ?,
+                    agencia = ?,
+                    conta = ?,
+                    pix = ?,
+                    valorUSD = ?,
+                    cotacao = ?,
+                    valorTotal = ?,
+                    taxaSaque = ?
+                WHERE id_interno = ?");
+                
+                $timestamp = isset($saque['timestamp']) ? $saque['timestamp'] : date('Y-m-d H:i:s');
+                
+                $stmt->execute([
+                    $timestamp,
+                    $saque['nome'] ?? '',
+                    $saque['cpf'] ?? '',
+                    $saque['id'] ?? $saque['id_externo'] ?? '',
+                    $saque['banco'] ?? '',
+                    $saque['agencia'] ?? '',
+                    $saque['conta'] ?? '',
+                    $saque['pix'] ?? '',
+                    $saque['valorUSD'] ?? 0,
+                    $saque['cotacao'] ?? 0,
+                    $saque['valorTotal'] ?? 0,
+                    $saque['taxaSaque'] ?? 0,
+                    $saque['id_interno']
+                ]);
+            } else {
+                // Insere novo saque
+                $stmt = $pdo->prepare("INSERT INTO saques (
+                    id_interno,
+                    timestamp,
+                    nome,
+                    cpf,
+                    id_externo,
+                    banco,
+                    agencia,
+                    conta,
+                    pix,
+                    valorUSD,
+                    cotacao,
+                    valorTotal,
+                    taxaSaque
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                
+                $timestamp = isset($saque['timestamp']) ? $saque['timestamp'] : date('Y-m-d H:i:s');
+                
+                $stmt->execute([
+                    $saque['id_interno'],
+                    $timestamp,
+                    $saque['nome'] ?? '',
+                    $saque['cpf'] ?? '',
+                    $saque['id'] ?? $saque['id_externo'] ?? '',
+                    $saque['banco'] ?? '',
+                    $saque['agencia'] ?? '',
+                    $saque['conta'] ?? '',
+                    $saque['pix'] ?? '',
+                    $saque['valorUSD'] ?? 0,
+                    $saque['cotacao'] ?? 0,
+                    $saque['valorTotal'] ?? 0,
+                    $saque['taxaSaque'] ?? 0
+                ]);
+            }
+            
+            $processados++;
+        }
+        
+        // Comita a transação
+        $pdo->commit();
+        
+        // Obtém a lista completa atualizada para retornar ao cliente
+        $stmt = $pdo->query("SELECT * FROM saques ORDER BY timestamp DESC");
+        $saquesAtualizados = $stmt->fetchAll();
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Saques atualizados com sucesso',
+            'stats' => [
+                'processados' => $processados
+            ],
+            'saques' => $saquesAtualizados
+        ]);
+    } catch (PDOException $e) {
+        // Reverte a transação em caso de erro
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        
+        echo json_encode([
+            'success' => false,
+            'message' => 'Erro ao atualizar saques: ' . $e->getMessage()
+        ]);
+    }
 }
+?>

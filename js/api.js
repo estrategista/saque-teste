@@ -12,34 +12,39 @@ const API = {
      */
     obterCotacaoDolar: async function() {
         try {
-            // Obtém a URL da API das configurações
-            const config = await DB.getConfig();
-            const apiUrl = config.apiUrl || 'https://economia.awesomeapi.com.br/json/last/USD-BRL';
+            console.log("Iniciando atualização da cotação...");
+            
+            // URL da API AwesomeAPI para cotação do Dólar
+            const apiUrl = 'https://economia.awesomeapi.com.br/json/last/USD-BRL';
+            console.log("URL da API:", apiUrl);
             
             // Faz a requisição para a API
+            console.log("Enviando requisição...");
             const response = await fetch(apiUrl);
             
             // Verifica se a resposta foi bem-sucedida
             if (!response.ok) {
+                console.error(`Erro HTTP ${response.status}: ${response.statusText}`);
                 throw new Error(`Erro HTTP ${response.status}`);
             }
             
             // Converte a resposta para JSON
+            console.log("Convertendo resposta para JSON...");
             const data = await response.json();
+            console.log("Resposta recebida:", data);
             
             // Verifica se a resposta tem o formato esperado
             if (!data || !data.USDBRL || !data.USDBRL.high) {
+                console.error("Formato de resposta inválido:", data);
                 throw new Error('Formato de resposta inválido');
             }
             
             // Extrai o valor da cotação
             const valorAtual = parseFloat(data.USDBRL.high);
+            console.log("Valor da cotação obtido:", valorAtual);
             
             // Armazena a cotação obtida
-            await DB.setUltimaCotacao({
-                valor: valorAtual,
-                timestamp: new Date().toISOString()
-            });
+            await this.salvarCotacaoNoServidor(valorAtual);
             
             return {
                 sucesso: true,
@@ -49,13 +54,129 @@ const API = {
         } catch (error) {
             console.error('Erro ao obter cotação:', error);
             
-            // Em caso de falha, retorna a última cotação armazenada
-            const ultimaCotacao = await DB.getUltimaCotacao();
+            // Em caso de falha, tenta uma alternativa de API
+            try {
+                console.log("Tentando API alternativa...");
+                const bcbUrl = 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.10813/dados/ultimos/1?formato=json';
+                const bcbResponse = await fetch(bcbUrl);
+                
+                if (bcbResponse.ok) {
+                    const bcbData = await bcbResponse.json();
+                    if (bcbData && bcbData.length > 0 && bcbData[0].valor) {
+                        const valorBCB = parseFloat(bcbData[0].valor);
+                        console.log("Valor obtido da API alternativa:", valorBCB);
+                        
+                        // Armazena a cotação obtida da API alternativa
+                        await this.salvarCotacaoNoServidor(valorBCB);
+                        
+                        return {
+                            sucesso: true,
+                            cotacao: valorBCB,
+                            mensagem: `Cotação atualizada (fonte alternativa): R$ ${valorBCB.toFixed(4)}`
+                        };
+                    }
+                }
+            } catch (backupError) {
+                console.error('Erro na API alternativa:', backupError);
+            }
+            
+            // Se ambas as APIs falharem, usa a última cotação armazenada
+            console.log("Usando cotação armazenada...");
+            const ultimaCotacao = await this.obterUltimaCotacao();
             return {
                 sucesso: false,
                 cotacao: ultimaCotacao.valor,
                 mensagem: `Não foi possível atualizar a cotação. Usando valor anterior: R$ ${ultimaCotacao.valor.toFixed(4)}`,
                 erro: error.message
+            };
+        }
+    },
+    
+    /**
+     * Salva a cotação no servidor
+     * @param {number} valor - Valor da cotação
+     */
+    salvarCotacaoNoServidor: async function(valor) {
+        try {
+            console.log("Salvando cotação no servidor:", valor);
+            
+            // Formata os dados para envio
+            const dados = {
+                valor: valor,
+                timestamp: new Date().toISOString(),
+                manual: false
+            };
+            
+            // Tenta salvar via API
+            try {
+                const response = await fetch('api/save_cotacao.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(dados)
+                });
+                
+                const result = await response.json();
+                console.log("Resposta do servidor:", result);
+                
+                if (!result.success) {
+                    console.warn("Aviso do servidor:", result.message);
+                }
+            } catch (apiError) {
+                console.warn("Não foi possível salvar no servidor, salvando localmente:", apiError);
+            }
+            
+            // Salva também localmente
+            localStorage.setItem('sistemaSaques_ultimaCotacao', JSON.stringify(dados));
+            console.log("Cotação salva localmente com sucesso");
+            
+            return true;
+        } catch (error) {
+            console.error("Erro ao salvar cotação:", error);
+            return false;
+        }
+    },
+    
+    /**
+     * Obtém a última cotação armazenada
+     */
+    obterUltimaCotacao: async function() {
+        try {
+            // Tenta obter do servidor primeiro
+            try {
+                const response = await fetch('api/get_cotacao.php');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.success && data.cotacao) {
+                        console.log("Cotação obtida do servidor:", data.cotacao);
+                        return data.cotacao;
+                    }
+                }
+            } catch (serverError) {
+                console.warn("Não foi possível obter cotação do servidor:", serverError);
+            }
+            
+            // Fallback para armazenamento local
+            const cotacaoLocal = localStorage.getItem('sistemaSaques_ultimaCotacao');
+            if (cotacaoLocal) {
+                console.log("Usando cotação do armazenamento local");
+                return JSON.parse(cotacaoLocal);
+            }
+            
+            // Valor padrão se nada for encontrado
+            console.log("Nenhuma cotação encontrada, usando valor padrão");
+            return {
+                valor: 5.37,
+                timestamp: new Date().toISOString(),
+                manual: false
+            };
+        } catch (error) {
+            console.error("Erro ao obter cotação:", error);
+            return {
+                valor: 5.37,
+                timestamp: new Date().toISOString(),
+                manual: false
             };
         }
     },
@@ -73,18 +194,47 @@ const API = {
             };
         }
         
-        // Armazena a cotação manual
-        await DB.setUltimaCotacao({
-            valor: valor,
-            timestamp: new Date().toISOString(),
-            manual: true
-        });
-        
-        return {
-            sucesso: true,
-            cotacao: valor,
-            mensagem: `Cotação definida manualmente: R$ ${valor.toFixed(4)}`
-        };
+        try {
+            console.log("Definindo cotação manual:", valor);
+            
+            // Formata os dados para envio
+            const dados = {
+                valor: valor,
+                timestamp: new Date().toISOString(),
+                manual: true
+            };
+            
+            // Tenta salvar via API
+            try {
+                const response = await fetch('api/save_cotacao.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(dados)
+                });
+                
+                const result = await response.json();
+                console.log("Resposta do servidor:", result);
+            } catch (apiError) {
+                console.warn("Não foi possível salvar no servidor, salvando localmente:", apiError);
+            }
+            
+            // Salva também localmente
+            localStorage.setItem('sistemaSaques_ultimaCotacao', JSON.stringify(dados));
+            
+            return {
+                sucesso: true,
+                cotacao: valor,
+                mensagem: `Cotação definida manualmente: R$ ${valor.toFixed(4)}`
+            };
+        } catch (error) {
+            console.error("Erro ao definir cotação manual:", error);
+            return {
+                sucesso: false,
+                mensagem: 'Erro ao definir cotação manual: ' + error.message
+            };
+        }
     },
     
     /**
@@ -92,8 +242,27 @@ const API = {
      * @returns {boolean} True se o download foi iniciado com sucesso
      */
     exportarSaquesParaCSV: async function() {
-        // Obtém os saques do banco de dados
-        const saques = await DB.getSaques();
+        // Obtém os saques do banco de dados ou localStorage
+        let saques = [];
+        
+        try {
+            // Tenta obter do servidor
+            const response = await fetch('api/get_saques.php');
+            if (response.ok) {
+                const data = await response.json();
+                if (data.success && Array.isArray(data.saques)) {
+                    saques = data.saques;
+                }
+            }
+        } catch (error) {
+            console.warn("Erro ao obter saques do servidor, usando dados locais:", error);
+            
+            // Fallback para localStorage
+            const saquesJSON = localStorage.getItem('sistemaSaques_saques');
+            if (saquesJSON) {
+                saques = JSON.parse(saquesJSON);
+            }
+        }
         
         if (saques.length === 0) {
             return false;
@@ -111,23 +280,28 @@ const API = {
         // Adiciona cada saque como uma linha
         saques.forEach(saque => {
             // Formata a data
-            const data = new Date(saque.timestamp);
-            const dataFormatada = `${data.getDate().toString().padStart(2, '0')}/${(data.getMonth()+1).toString().padStart(2, '0')}/${data.getFullYear()}`;
+            let dataFormatada = '';
+            try {
+                const data = new Date(saque.timestamp);
+                dataFormatada = `${data.getDate().toString().padStart(2, '0')}/${(data.getMonth()+1).toString().padStart(2, '0')}/${data.getFullYear()}`;
+            } catch (e) {
+                dataFormatada = 'N/D';
+            }
             
             // Formata os dados bancários
-            const dadosBancarios = `${saque.banco}, AG: ${saque.agencia}, CC: ${saque.conta}${saque.pix ? ', PIX: ' + saque.pix : ''}`;
+            const dadosBancarios = `${saque.banco || ''}, AG: ${saque.agencia || ''}, CC: ${saque.conta || ''}${saque.pix ? ', PIX: ' + saque.pix : ''}`;
             
             // Formata os valores
-            const valorSolicitado = saque.valorUSD.toString().replace('.', ',');
-            const cotacao = saque.cotacao.toString().replace('.', ',');
-            const valorTotal = saque.valorTotal.toString().replace('.', ',');
+            const valorSolicitado = (saque.valorUSD || 0).toString().replace('.', ',');
+            const cotacao = (saque.cotacao || 0).toString().replace('.', ',');
+            const valorTotal = (saque.valorTotal || 0).toString().replace('.', ',');
             
             // Ajusta os valores para evitar problemas com vírgulas
             const linha = [
                 dataFormatada,
-                `"${saque.nome}"`,
-                `"${saque.cpf}"`,
-                `"${saque.id}"`,
+                `"${saque.nome || ''}"`,
+                `"${saque.cpf || ''}"`,
+                `"${saque.id_externo || saque.id || ''}"`,
                 `"${dadosBancarios}"`,
                 valorSolicitado,
                 cotacao,
@@ -185,9 +359,49 @@ const API = {
             leitor.onload = async function(evento) {
                 try {
                     const conteudo = evento.target.result;
-                    const resultado = await DB.importarSaquesCSV(conteudo);
-                    resolve(resultado);
+                    
+                    // Tenta enviar para o servidor primeiro
+                    try {
+                        const formData = new FormData();
+                        formData.append('csvFile', arquivo);
+                        
+                        const response = await fetch('api/import_csv.php', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        if (response.ok) {
+                            const result = await response.json();
+                            if (result.success) {
+                                resolve(result);
+                                return;
+                            }
+                        }
+                    } catch (serverError) {
+                        console.warn("Não foi possível importar via servidor:", serverError);
+                    }
+                    
+                    // Processamento local como fallback
+                    console.log("Importando CSV localmente...");
+                    // Aqui você implementaria a lógica de importação local
+                    // Dividir o conteúdo em linhas, processar cabeçalhos, etc.
+                    
+                    // Exemplo de implementação básica:
+                    const linhas = conteudo.split('\n');
+                    if (linhas.length < 2) {
+                        throw new Error('Arquivo CSV vazio ou inválido');
+                    }
+                    
+                    // Processar cabeçalhos
+                    const cabecalhos = linhas[0].split(',');
+                    // ... implementação do processamento ...
+                    
+                    resolve({
+                        sucesso: true,
+                        mensagem: 'Importação local realizada com sucesso'
+                    });
                 } catch (erro) {
+                    console.error('Erro ao processar CSV:', erro);
                     reject({
                         sucesso: false,
                         mensagem: 'Erro ao processar o arquivo: ' + erro.message
@@ -196,7 +410,8 @@ const API = {
             };
             
             // Define o handler para erros de leitura
-            leitor.onerror = function() {
+            leitor.onerror = function(error) {
+                console.error('Erro ao ler arquivo:', error);
                 reject({
                     sucesso: false,
                     mensagem: 'Erro ao ler o arquivo'

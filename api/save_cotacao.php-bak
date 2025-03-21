@@ -4,10 +4,6 @@
  * Salva uma nova cotação
  */
 
-// Habilita exibição de erros para depuração
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
 // Inclui o arquivo de configuração
 require_once '../db_config.php';
 
@@ -34,20 +30,13 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-// Log para depuração
-error_log('Iniciando save_cotacao.php');
-
 // Obtém os dados enviados
-$raw_input = file_get_contents('php://input');
-error_log('Dados recebidos: ' . $raw_input);
-
-$dados = json_decode($raw_input, true);
+$dados = json_decode(file_get_contents('php://input'), true);
 
 if (!$dados || !isset($dados['valor'])) {
     echo json_encode([
         'success' => false,
-        'message' => 'Dados inválidos',
-        'received' => $raw_input
+        'message' => 'Dados inválidos'
     ]);
     exit;
 }
@@ -65,35 +54,27 @@ if (!$pdo) {
 
 try {
     // Prepara a inserção
-    $stmt = $pdo->prepare("INSERT INTO cotacao (valor, timestamp, `is_manual`) VALUES (?, ?, ?)");
+    $stmt = $pdo->prepare("INSERT INTO cotacao (valor, timestamp, manual) VALUES (?, ?, ?)");
     
     // Determina se é manual
-    $is_manual = isset($dados['manual']) ? (int)$dados['manual'] : 0;
+    $manual = isset($dados['manual']) ? (int)$dados['manual'] : 0;
     
     // Define o timestamp
     $timestamp = isset($dados['timestamp']) ? $dados['timestamp'] : date('Y-m-d H:i:s');
     
     // Executa a inserção
-    $result = $stmt->execute([$dados['valor'], $timestamp, $is_manual]);
+    $stmt->execute([$dados['valor'], $timestamp, $manual]);
     
-    if ($result) {
-        echo json_encode([
-            'success' => true,
-            'message' => 'Cotação salva com sucesso!',
-            'cotacao' => [
-                'valor' => (float)$dados['valor'],
-                'timestamp' => $timestamp,
-                'manual' => (bool)$is_manual
-            ]
-        ]);
-    } else {
-        echo json_encode([
-            'success' => false,
-            'message' => 'Falha ao salvar a cotação no banco de dados'
-        ]);
-    }
+    echo json_encode([
+        'success' => true,
+        'message' => 'Cotação salva com sucesso!',
+        'cotacao' => [
+            'valor' => (float)$dados['valor'],
+            'timestamp' => $timestamp,
+            'manual' => (bool)$manual
+        ]
+    ]);
 } catch (PDOException $e) {
-    error_log('Erro PDO: ' . $e->getMessage());
     echo json_encode([
         'success' => false,
         'message' => 'Erro ao salvar cotação: ' . $e->getMessage()

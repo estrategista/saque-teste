@@ -4,10 +4,6 @@
  * Obtém a última cotação armazenada
  */
 
-// Habilita exibição de erros para depuração
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
 // Inclui o arquivo de configuração
 require_once '../db_config.php';
 
@@ -24,9 +20,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     http_response_code(200);
     exit;
 }
-
-// Log para depuração
-error_log('Iniciando get_cotacao.php');
 
 // Tenta conectar ao banco de dados
 $pdo = conectarBD();
@@ -45,15 +38,12 @@ try {
     $cotacao = $stmt->fetch();
     
     if ($cotacao) {
-        // Verifica se a coluna é 'manual' ou 'is_manual'
-        $manualField = isset($cotacao['manual']) ? 'manual' : 'is_manual';
-        
         echo json_encode([
             'success' => true,
             'cotacao' => [
                 'valor' => (float)$cotacao['valor'],
                 'timestamp' => $cotacao['timestamp'],
-                'manual' => (bool)$cotacao[$manualField]
+                'manual' => (bool)$cotacao['manual']
             ]
         ]);
     } else {
@@ -68,7 +58,6 @@ try {
         ]);
     }
 } catch (PDOException $e) {
-    error_log('Erro PDO: ' . $e->getMessage());
     echo json_encode([
         'success' => false,
         'message' => 'Erro ao obter cotação: ' . $e->getMessage()
